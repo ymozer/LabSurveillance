@@ -1,0 +1,5 @@
+**/venv
+**/.venv
+.hf_cache/
+evidence_snapshots/
+**/__pycache__/
