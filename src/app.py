@@ -8,10 +8,8 @@ from PIL import Image
 from backend import SurveillanceAI, DEFAULT_MODELS
 from datetime import datetime
 
-# Initialize Backend (Empty initially)
 ai_engine = SurveillanceAI()
 
-# --- Shared State Management ---
 class SystemState:
     def __init__(self):
         self.running = False
@@ -23,8 +21,6 @@ class SystemState:
         self.check_interval = 5 
         self.log_history = []
 
-        # Alert display policy: keep alert overlays visible briefly,
-        # then automatically clear them from the live view.
         self.alert_display_seconds = 3.0
         self.last_alert_time = 0.0
         self.last_safe_text = "Status: Safe"
@@ -50,7 +46,6 @@ def get_surveillance_prompt():
         "Example: ALERT: Student sleeping [450, 200, 600, 500]"
     )
 
-# --- Helper: Parse Boxes (Same as before) ---
 def extract_boxes(text_response, img_width, img_height):
     found_boxes = []
     matches = re.findall(r'\[(\d+),\s*(\d+),\s*(\d+),\s*(\d+)\]', text_response)
@@ -68,7 +63,6 @@ def extract_boxes(text_response, img_width, img_height):
             continue
     return found_boxes
 
-# --- AI Thread ---
 def ai_worker_loop():
     print("AI Worker Thread: Started")
     last_check_time = 0
@@ -76,7 +70,6 @@ def ai_worker_loop():
     while state.running:
         current_time = time.time()
         
-        # Only run if model is ready and time interval passed
         if (current_time - last_check_time > state.check_interval) and \
            (state.frame_for_ai is not None) and \
            ai_engine.ready:
@@ -88,10 +81,8 @@ def ai_worker_loop():
 
                 pil_image = Image.fromarray(frame_rgb)
                 
-                # RUN AI
                 result_text = ai_engine.analyze_frame_pil(pil_image, get_surveillance_prompt())
                 
-                # Parse
                 new_boxes = extract_boxes(result_text, width, height)
                 timestamp = datetime.now().strftime("%H:%M:%S")
                 with state.state_lock:
@@ -102,7 +93,6 @@ def ai_worker_loop():
                     else:
                         state.last_safe_text = state.ai_text
                 
-                # Log & Snapshot
                 if "ALERT" in result_text:
                     log_entry = f"[{timestamp}] 🚨 {result_text}"
                     evidence_frame = state.frame_for_ai.copy()
@@ -130,33 +120,27 @@ def ai_worker_loop():
         time.sleep(0.1)
     print("AI Worker Thread: Stopped")
 
-# --- Model Management ---
 def apply_model_settings(model_choice, use_4bit):
     if not model_choice:
         return "⚠️ Please select a model first."
     
-    # Pause monitoring if running (optional, but safer)
     was_running = state.running
     state.running = False
-    time.sleep(1) # Wait for thread to loop
+    time.sleep(1)
     
     status = ai_engine.load_model(model_choice, use_4bit)
     
-    # Resume if it was running
     if was_running:
         state.running = True
-        # Restart thread if it died (it shouldn't have, but good practice)
         if threading.active_count() < 2: 
              t = threading.Thread(target=ai_worker_loop, daemon=True)
              t.start()
              
     return status
 
-# --- Monitor Loop ---
 def monitor_stream(cam_id, interval_setting):
     state.check_interval = float(interval_setting)
     
-    # Check if model is loaded
     if not ai_engine.ready:
         yield None, "❌ ERROR: No AI Model Loaded. Please use 'System Setup' above.", ""
         return
@@ -183,7 +167,6 @@ def monitor_stream(cam_id, interval_setting):
             with state.frame_lock:
                 state.frame_for_ai = frame.copy()
             
-            # Snapshot AI state for this frame
             with state.state_lock:
                 ai_text = state.ai_text
                 ai_boxes = list(state.ai_boxes)
@@ -191,14 +174,12 @@ def monitor_stream(cam_id, interval_setting):
                 last_alert_time = state.last_alert_time
                 alert_ttl = float(state.alert_display_seconds)
 
-            # Auto-clear alert overlays after TTL, even if the last model output stays on ALERT.
             alert_active = (
                 "ALERT" in ai_text
                 and last_alert_time > 0
                 and (time.time() - last_alert_time) <= alert_ttl
             )
 
-            # Draw UI (boxes + "ALERT" tag only while alert is active)
             if alert_active:
                 for (x1, y1, x2, y2) in ai_boxes:
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
@@ -206,7 +187,6 @@ def monitor_stream(cam_id, interval_setting):
 
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
-            # Text Overlay
             cv2.rectangle(frame_rgb, (0, 0), (900, 40), (0,0,0), -1)
             display_text = ai_text if alert_active else (last_safe_text or ai_text)
             color = (255, 50, 50) if alert_active else (50, 255, 50)
@@ -229,11 +209,9 @@ def analyze_file(file, prompt):
     media_type = "video" if file.endswith(('.mp4', '.avi', '.mov')) else "image"
     return ai_engine.analyze_media(file, prompt, media_type)
 
-# --- UI Layout ---
 with gr.Blocks(title="Sentinel AI - Multi-Model") as demo:
     gr.Markdown("# 🛡️ Qwen Sentinel - Multi-Model Lab")
     
-    # SYSTEM SETUP
     with gr.Row(variant="panel"):
         gr.Markdown("### ⚙️ System Setup")
         with gr.Column(scale=2):
@@ -252,7 +230,6 @@ with gr.Blocks(title="Sentinel AI - Multi-Model") as demo:
     load_btn.click(apply_model_settings, inputs=[model_selector, quant_check], outputs=[load_status])
 
     with gr.Tabs():
-        # LIVE TAB
         with gr.Tab("Live Surveillance"):
             with gr.Row():
                 with gr.Column(scale=3):
@@ -272,7 +249,6 @@ with gr.Blocks(title="Sentinel AI - Multi-Model") as demo:
             start_btn.click(monitor_stream, inputs=[cam_input, interval_slider], outputs=[live_display, current_status, log_box])
             stop_btn.click(stop_monitoring, outputs=[current_status])
 
-        # INVESTIGATE TAB
         with gr.Tab("Investigate Footage"):
             with gr.Row():
                 with gr.Column():

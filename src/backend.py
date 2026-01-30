@@ -15,37 +15,23 @@ from huggingface_hub import hf_hub_download
 
 
 def _configure_hf_downloads(project_root: str) -> str:
-    """Best-effort Hugging Face Hub config for Windows reliability.
-
-    Notes:
-    - Large files can appear "stuck" near 99% while the hub finalizes the
-      download (hash check, flush to disk, atomic rename). On Windows this step
-      is frequently slowed by antivirus / filesystem drivers.
-    - We set environment variables only if the user hasn't already set them.
-    """
-
     cache_dir = os.environ.get("HF_HOME")
     if not cache_dir:
         cache_dir = os.path.join(project_root, ".hf_cache")
         os.environ.setdefault("HF_HOME", cache_dir)
 
-    # Keep caches co-located (older libs may still consult these).
     os.environ.setdefault("HF_HUB_CACHE", os.path.join(cache_dir, "hub"))
     os.environ.setdefault("TRANSFORMERS_CACHE", os.path.join(cache_dir, "transformers"))
 
-    # Faster downloader when available (falls back silently if not installed).
     os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 
-    # Reduce spurious "hangs" from slow etag requests / final range fetch.
     os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "60")
     os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "1800")
 
-    # Windows users often don't have symlink privileges; avoid noisy warnings.
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
     os.makedirs(cache_dir, exist_ok=True)
 
-    # huggingface_hub reads these at import time; update them at runtime too.
     try:
         from huggingface_hub import constants as hub_constants
         from huggingface_hub.utils._http import close_session
@@ -58,7 +44,6 @@ def _configure_hf_downloads(project_root: str) -> str:
 
     return cache_dir
 
-# Try importing llama-cpp for GGUF support
 try:
     from llama_cpp import Llama, LlamaChatFormat
     GGUF_AVAILABLE = True
@@ -69,10 +54,10 @@ DEFAULT_MODELS = {
     "Qwen3-VL-2B-Instruct":         { "type": "hf", "id": "Qwen/Qwen3-VL-2B-Instruct"},
     "Qwen3-VL-2B-Instruct-FP8":     { "type": "hf", "id": "Qwen/Qwen3-VL-2B-Instruct-FP8"},
     "Qwen3-VL-2B-Instruct-GGUF":    { "type": "gguf", "id": "Qwen/Qwen3-VL-2B-Instruct-GGUF"},
-    "Qwen3-VL-4B-Instruct":         { "type": "hf", "id": "Qwen/Qwen3-VL-4B-Instruct"}, # 8 GB VRAM minimum
+    "Qwen3-VL-4B-Instruct":         { "type": "hf", "id": "Qwen/Qwen3-VL-4B-Instruct"},
     "Qwen3-VL-4B-Instruct-FP8":     { "type": "hf", "id": "Qwen/Qwen3-VL-4B-Instruct-FP8"},
     "Qwen3-VL-4B-Instruct-GGUF":    { "type": "gguf", "id": "Qwen/Qwen3-VL-4B-Instruct-GGUF"},
-    "Qwen3-VL-8B-Instruct":         { "type": "hf", "id": "Qwen/Qwen3-VL-8B-Instruct"}, # RECOMMENDED for ACC, 16 GB VRAM minimum
+    "Qwen3-VL-8B-Instruct":         { "type": "hf", "id": "Qwen/Qwen3-VL-8B-Instruct"},
     "Qwen3-VL-8B-Instruct-FP8":     { "type": "hf", "id": "Qwen/Qwen3-VL-8B-Instruct-FP8"},
     "Qwen3-VL-8B-Instruct-GGUF":    { "type": "gguf", "id": "Qwen/Qwen3-VL-8B-Instruct-GGUF"},
 }
@@ -85,15 +70,12 @@ class SurveillanceAI:
     def __init__(self):
         self.model = None
         self.processor = None
-        self.current_model_type = None # 'hf' or 'gguf'
+        self.current_model_type = None
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.ready = False 
         self.lock = threading.RLock()
 
     def load_model(self, model_key, use_4bit=False):
-        """
-        Dynamically loads a model (HF or GGUF), unloading the previous one.
-        """
         if model_key not in DEFAULT_MODELS:
             return f"Error: Model {model_key} not found."
 
@@ -116,7 +98,6 @@ class SurveillanceAI:
             cache_dir = _configure_hf_downloads(project_root)
             print(f"📦 HF cache: {cache_dir}")
             
-            # 1. Cleanup Memory
             if self.model is not None:
                 del self.model
                 if self.processor: del self.processor
@@ -127,7 +108,6 @@ class SurveillanceAI:
                 print("🧹 VRAM cleared.")
 
             try:
-                # --- GGUF LOADING ---
                 if model_type == "gguf":
                     if not GGUF_AVAILABLE:
                         return "Error: `llama-cpp-python` not installed. Run: pip install llama-cpp-python"
@@ -136,7 +116,6 @@ class SurveillanceAI:
                     if not filename:
                         return "Error: GGUF config missing 'filename'."
 
-                    # Download or retrieve path
                     print(f"📥 Verifying/Downloading {filename}...")
                     model_path = hf_hub_download(
                         repo_id=model_id,
@@ -145,17 +124,14 @@ class SurveillanceAI:
                         resume_download=True,
                     )
 
-                    # Load Llama
-                    # n_gpu_layers=-1 attempts to offload ALL layers to GPU
                     self.model = Llama(
                         model_path=model_path,
-                        n_ctx=4096,            # Vision models need large context
-                        n_gpu_layers=-1,       # Max GPU usage
+                        n_ctx=4096,
+                        n_gpu_layers=-1,
                         verbose=False
                     )
                     self.current_model_type = "gguf"
 
-                # --- HUGGING FACE LOADING ---
                 else:
                     bnb_config = None
                     if use_4bit:
@@ -165,9 +141,6 @@ class SurveillanceAI:
                             bnb_4bit_compute_dtype=torch.bfloat16
                         )
 
-                    # transformers 5.0.1.dev0 workaround:
-                    # Some configs define `quantization_config` but don't populate it from config.json,
-                    # and the quantizer detection code crashes on None.
                     config_obj = AutoConfig.from_pretrained(
                         model_id,
                         trust_remote_code=True,
@@ -187,7 +160,6 @@ class SurveillanceAI:
                             if isinstance(raw_qc, dict) and raw_qc:
                                 config_obj.quantization_config = raw_qc
                         except Exception:
-                            # If we can't hydrate it, proceed; transformers may still handle it.
                             pass
 
                     self.processor = AutoProcessor.from_pretrained(
@@ -216,8 +188,6 @@ class SurveillanceAI:
                 traceback.print_exc()
                 self.ready = False
 
-                # Friendly fallback: FP8 checkpoints commonly require Triton and/or newer GPUs.
-                # If that environment isn't available, try the non-FP8 variant automatically.
                 err_str = str(e)
                 if "FP8" in model_key and (
                     "No module named 'triton'" in err_str
@@ -234,8 +204,6 @@ class SurveillanceAI:
     def analyze_media(self, media_path, prompt, media_type="image"):
         if not self.ready: return "Error: Model not loaded."
 
-        # Prepare messages based on media type logic
-        # Note: GGUF implementation here primarily supports Images for now.
         if media_type == "video" and self.current_model_type == "gguf":
             return "Warning: Video analysis is not fully optimized for GGUF in this version. Try 'image'."
 
@@ -243,7 +211,6 @@ class SurveillanceAI:
              pil_image = Image.open(media_path)
              return self.analyze_frame_pil(pil_image, prompt)
         
-        # Fallback for HF Video
         messages = [{
             "role": "user",
             "content": [
@@ -257,7 +224,6 @@ class SurveillanceAI:
         if not self.ready: return "Waiting..."
 
         if self.current_model_type == "gguf":
-            # GGUF expects Base64 for images in OpenAI-compatible format
             base64_img = pil_to_base64(pil_image)
             messages = [{
                 "role": "user",
@@ -268,7 +234,6 @@ class SurveillanceAI:
             }]
             return self._run_inference_gguf(messages)
         else:
-            # HF Standard Format
             messages = [{
                 "role": "user",
                 "content": [
@@ -284,7 +249,7 @@ class SurveillanceAI:
                 response = self.model.create_chat_completion(
                     messages=messages,
                     max_tokens=max_tokens,
-                    temperature=0.2 # Low temp for factual surveillance
+                    temperature=0.2
                 )
                 return response['choices'][0]['message']['content']
         except Exception as e:
@@ -292,7 +257,6 @@ class SurveillanceAI:
             return f"Error: {e}"
 
     def _run_inference(self, messages, max_tokens=256):
-        """HF Inference"""
         try:
             with self.lock:
                 text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
