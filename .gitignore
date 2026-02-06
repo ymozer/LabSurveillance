@@ -3,3 +3,4 @@
 .hf_cache/
 evidence_snapshots/
 **/__pycache__/
+**/*.mp4
