@@ -404,7 +404,8 @@ def _normalize_ai_response(raw_text: str) -> str:
         colon_pos = raw_text.find(":")
         if colon_pos != -1:
             return "ALERT:" + raw_text[colon_pos + 1:]
-        return "ALERT: " + raw_text[6:].strip()  # len('alert') + possible space
+        # len('alert') + possible space
+        return "ALERT: " + raw_text[6:].strip()
 
     if "status" in text_lower and "safe" in text_lower:
         return "Status: Safe"
@@ -414,7 +415,8 @@ def _normalize_ai_response(raw_text: str) -> str:
         if kw in text_lower:
             # The model described a prohibited activity without using ALERT format
             description = raw_text.strip().split("\n")[0][:120]
-            log_debug(f"Normalised freeform response to ALERT (matched '{kw}'): {description}")
+            log_debug(
+                f"Normalised freeform response to ALERT (matched '{kw}'): {description}")
             return f"ALERT: {description}"
 
     # Nothing suspicious found
@@ -1060,7 +1062,8 @@ def _analyze_uploaded_video(upload_path: str, prompt: str):
     finally:
         cap.release()
 
-    result = ai_engine.analyze_video_clip(frames, prompt, system_prompt=SYSTEM_PROMPT)
+    result = ai_engine.analyze_video_clip(
+        frames, prompt, system_prompt=SYSTEM_PROMPT)
     return _normalize_ai_response(result), None
 
 
