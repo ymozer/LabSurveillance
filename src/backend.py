@@ -1,5 +1,6 @@
 import os
 import gc
+import re
 import tempfile
 import threading
 
@@ -37,6 +38,13 @@ DEFAULT_MODELS = {
     "Qwen3-VL-8B-Instruct":         {"type": "hf", "id": "Qwen/Qwen3-VL-8B-Instruct"},
     "Qwen3-VL-8B-Instruct-FP8":     {"type": "hf", "id": "Qwen/Qwen3-VL-8B-Instruct-FP8"},
 }
+
+
+def _strip_thinking(text: str) -> str:
+    """Remove <think>...</think> reasoning blocks from Qwen3 model output."""
+    cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+    # If stripping removed everything, return original
+    return cleaned if cleaned else text
 
 
 class SurveillanceAI:
@@ -110,7 +118,7 @@ class SurveillanceAI:
                 self.ready = False
                 return f"Error: {str(e)}"
 
-    def analyze_video_clip(self, frame_list_pil, prompt):
+    def analyze_video_clip(self, frame_list_pil, prompt, system_prompt=None):
         """
         Analyzes a sequence of frames. 
         Note: We send frames as a sequence of 'image' types to bypass 
@@ -131,16 +139,19 @@ class SurveillanceAI:
         # Add the text prompt at the end
         content_blocks.append({"type": "text", "text": prompt})
 
-        messages = [
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append(
             {
                 "role": "user",
                 "content": content_blocks,
             }
-        ]
+        )
 
         return self._run_inference(messages)
 
-    def analyze_video_clip_as_video(self, frame_list_pil, prompt, fps=2.0):
+    def analyze_video_clip_as_video(self, frame_list_pil, prompt, fps=2.0, system_prompt=None):
         """
         Analyzes a sequence of frames using a 'video' content block.
         Saves frames to temp files to preserve temporal encoding.
@@ -158,7 +169,10 @@ class SurveillanceAI:
                 frame.save(path)
                 paths.append(path)
 
-            messages = [
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append(
                 {
                     "role": "user",
                     "content": [
@@ -166,12 +180,12 @@ class SurveillanceAI:
                         {"type": "text", "text": prompt},
                     ],
                 }
-            ]
+            )
 
             result = self._run_inference(messages)
             if isinstance(result, str) and result.startswith("Error:"):
                 # Fallback to image-sequence mode if video processing fails
-                return self.analyze_video_clip(frame_list_pil, prompt)
+                return self.analyze_video_clip(frame_list_pil, prompt, system_prompt=system_prompt)
             return result
 
     def analyze_single_image(self, pil_image, prompt):
@@ -194,9 +208,15 @@ class SurveillanceAI:
         try:
             with self.lock:
                 # 1. Prepare inputs using qwen_vl_utils
-                text = self.processor.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
+                try:
+                    text = self.processor.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True,
+                        enable_thinking=False,
+                    )
+                except TypeError:
+                    text = self.processor.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
 
                 image_inputs, video_inputs, video_kwargs = process_vision_info(
                     messages, True, True)
@@ -261,6 +281,7 @@ class SurveillanceAI:
                     generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
                 )[0]
 
+                output_text = _strip_thinking(output_text)
                 return output_text
 
         except Exception as e:
