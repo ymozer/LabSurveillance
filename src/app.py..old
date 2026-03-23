@@ -13,35 +13,35 @@ from datetime import datetime
 
 # --- Configuration ---
 BUFFER_SECONDS = 4       # How many seconds of history to keep
-SAMPLE_FRAMES = 8        # How many frames to send to AI
-CHECK_INTERVAL = 2.0     # Run AI every X seconds
-RESIZE_HEIGHT = 480      # Resize frames before sending to AI
-
-ai_engine = SurveillanceAI()
-
-DEFAULT_PROMPT = (
-    "Analyze this video clip from a lab surveillance camera. "
-    "Check for PROHIBITED activities that require motion context:\n"
-    "1. Running (moving fast across frames)\n"
-    "2. Fighting or Aggressive Physical Contact\n"
-    "3. Eating/Drinking\n"
-    "4. Tampering with equipment\n"
-    "5. Sleeping\n\n"
-    "OUTPUT FORMAT:\n"
-    "If SAFE: 'Status: Safe'\n"
-    "If DANGEROUS: 'ALERT: [Description of activity]'\n"
-    "If an alert is found, provide the bounding box of the person involved in the LAST frame: [xmin, ymin, xmax, ymax] (0-1000 scale)."
-)
-
-
-class SystemState:
-    def __init__(self):
-        self.running = False
-        self.frame_buffer = deque(maxlen=int(BUFFER_SECONDS * 30))
-        self.buffer_lock = threading.Lock()
-        self.trigger_ai_event = threading.Event()
-        self.ai_text = "System Standby."
-        self.ai_boxes = []
+SAMPLE_FRAMES = 8        # How many frames to send to AIs
+CHECK_INTERVAL = 2.0     # Run AI every X secondss
+RESIZE_HEIGHT = 480      # Resize frames before sending to AIs
+s
+ai_engine = SurveillanceAI()s
+s
+DEFAULT_PROMPT = (s
+    "Analyze this video clip from a lab surveillance camera. "s
+    "Check for PROHIBITED activities that require motion context:\n"s
+    "1. Running (moving fast across frames)\n"s
+    "2. Fighting or Aggressive Physical Contact\n"s
+    "3. Eating/Drinking\n"s
+    "4. Tampering with equipment\n"s
+    "5. Sleeping\n\n"s
+    "OUTPUT FORMAT:\n"s
+    "If SAFE: 'Status: Safe'\n"s
+    "If DANGEROUS: 'ALERT: [Description of activity]'\n"s
+    "If an alert is found, provide the bounding box of the person involved in the LAST frame: [xmin, ymin, xmax, ymax] (0-1000 scale)."s
+)s
+s
+s
+class SystemState:s
+    def __init__(self):s
+        self.running = Falses
+        self.frame_buffer = deque(maxlen=int(BUFFER_SECONDS * 30))s
+        self.buffer_lock = threading.Lock()s
+        self.trigger_ai_event = threading.Event()s
+        self.ai_text = "System Standby."s
+        self.ai_boxes = []s
         self.log_history = []
         self.debug_history = []
         self.debug_enabled = True
