@@ -8,6 +8,9 @@ import torch
 from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
 from qwen_vl_utils import process_vision_info
 
+# Reduce CUDA memory fragmentation on GPUs with limited VRAM
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 
 def _configure_hf_downloads(project_root: str) -> str:
     cache_dir = os.environ.get("HF_HOME")
@@ -89,22 +92,26 @@ class SurveillanceAI:
                         bnb_4bit_compute_dtype=torch.bfloat16
                     )
 
-                # Load Processor
+                # Load Processor – limit per-image pixels to control VRAM
                 self.processor = AutoProcessor.from_pretrained(
                     model_id,
                     trust_remote_code=True,
-                    cache_dir=cache_dir
+                    cache_dir=cache_dir,
+                    min_pixels=128 * 28 * 28,
+                    max_pixels=512 * 28 * 28,
                 )
 
                 # Load Model
                 # Note: Qwen2-VL and Qwen2.5-VL usually rely on flash_attn if available
+                dtype = torch.bfloat16 if use_4bit else torch.float16
                 self.model = AutoModelForImageTextToText.from_pretrained(
                     model_id,
                     trust_remote_code=True,
-                    torch_dtype="auto",
+                    torch_dtype=dtype,
                     device_map="auto",
                     quantization_config=bnb_config,
-                    cache_dir=cache_dir
+                    cache_dir=cache_dir,
+                    low_cpu_mem_usage=True,
                 )
 
                 self.current_model_type = "hf"
@@ -205,8 +212,10 @@ class SurveillanceAI:
         return self._run_inference(messages)
 
     def _run_inference(self, messages, max_tokens=256):
+        inputs = None
+        generated_ids = None
         try:
-            with self.lock:
+            with self.lock, torch.inference_mode():
                 # 1. Prepare inputs using qwen_vl_utils
                 try:
                     text = self.processor.apply_chat_template(
@@ -284,8 +293,20 @@ class SurveillanceAI:
                 output_text = _strip_thinking(output_text)
                 return output_text
 
+        except torch.cuda.OutOfMemoryError:
+            print("CUDA OOM – freeing cache and returning error")
+            return "Error: GPU out of memory. Reduce frame count or use a smaller model."
         except Exception as e:
             print(f"Inference Error: {e}")
             import traceback
             traceback.print_exc()
             return f"Error: {str(e)}"
+        finally:
+            # Always release GPU tensors to prevent VRAM leaks
+            try:
+                del inputs, generated_ids
+            except Exception:
+                pass
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()

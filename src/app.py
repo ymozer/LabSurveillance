@@ -1,4 +1,5 @@
 import cv2
+import gc
 import logging
 import os
 import re
@@ -13,6 +14,7 @@ from typing import Optional
 
 import gradio as gr
 import numpy as np
+import torch
 from PIL import Image
 
 from backend import DEFAULT_MODELS, SurveillanceAI
@@ -48,20 +50,27 @@ CONFIG = Config()
 os.makedirs(CONFIG.evidence_dir, exist_ok=True)
 
 DEFAULT_PROMPT = (
-    "Analyze this video clip from a computer lab surveillance camera. "
-    "Look at all the shown places and people in the clip. Even in the background and obscured areas. "
-    "People may be partially visible, far away, or in groups. Use the full clip context to understand their actions. "
-    "The clip may show multiple people. Determine if any PROHIBITED activities are occurring, "
-    "Check for PROHIBITED activities that require motion context:\n"
-    "1. Running (moving fast across frames)\n"
-    "2. Fighting or Aggressive Physical Contact\n"
-    "3. Eating/Drinking\n"
-    "4. Tampering with equipment\n"
-    "5. Sleeping\n"
-    "6. Phone usage\n\n"
-    "OUTPUT FORMAT:\n"
-    "If SAFE: 'Status: Safe'\n"
-    "If DANGEROUS: 'ALERT: [Description of activity]'"
+    "You are a surveillance system monitoring a computer lab. "
+    "You are shown a sequence of consecutive frames captured seconds apart from a surveillance camera.\n\n"
+    "Look carefully at EVERY person visible in these frames, including those partially visible, "
+    "far away, in the background, or in groups.\n\n"
+    "Determine if ANY of the following PROHIBITED activities are occurring:\n"
+    "1. Running (person moving fast across frames)\n"
+    "2. Fighting or aggressive physical contact between people\n"
+    "3. Eating or Drinking (food, beverages, bottles, cups near mouth)\n"
+    "4. Tampering with or damaging equipment\n"
+    "5. Sleeping (head down on desk, eyes closed)\n"
+    "6. Using a phone or mobile device (holding phone, looking at phone)\n\n"
+    "IMPORTANT: If you see ANY prohibited activity by ANY person, you MUST output an ALERT.\n"
+    "Even if only one person out of many is doing something prohibited, output ALERT.\n\n"
+    "OUTPUT FORMAT (respond with EXACTLY one line):\n"
+    "- If ALL activities are safe: Status: Safe\n"
+    "- If ANY prohibited activity is detected: ALERT: [describe what activity and who]\n\n"
+    "Examples:\n"
+    "- Status: Safe\n"
+    "- ALERT: Person at desk is eating food\n"
+    "- ALERT: Person in back row using phone\n"
+    "- ALERT: Two people fighting near entrance"
 )
 
 STRICT_MODE_SUFFIX = (
@@ -71,6 +80,14 @@ STRICT_MODE_SUFFIX = (
     "If motion suggests running or aggressive contact, alert. "
     "If a person appears to eat/drink, tamper with equipment, phone usage, or sleep, alert. "
     "Return exactly one line in the required format."
+)
+
+SYSTEM_PROMPT = (
+    "You are a strict computer lab surveillance AI. "
+    "Your ONLY job is to detect prohibited activities and output exactly one line: "
+    "either 'Status: Safe' or 'ALERT: [description]'. "
+    "Never describe the scene. Never explain your reasoning. "
+    "Just classify and respond in the required format."
 )
 
 BBOX_LOCALIZATION_PROMPT = (
@@ -93,6 +110,7 @@ class SystemState:
         self.running: bool = False
         self.source_type: str = "Camera"
         self.use_video_mode: bool = False
+        self.enable_bbox: bool = False
         self.debug_enabled: bool = True
         self.debug_save_clips: bool = False
         self.sample_strategy: str = "Uniform"
@@ -351,6 +369,58 @@ def build_prompt(base_prompt: str, strict: bool = False) -> str:
     return base_prompt + STRICT_MODE_SUFFIX if strict else base_prompt
 
 
+# --- Keywords that indicate prohibited activity even in freeform text ---
+_ACTIVITY_KEYWORDS = [
+    "eating", "drinking", "food", "beverage", "bottle", "cup",
+    "fighting", "aggressive", "punch", "hit", "attack",
+    "running", "sprint",
+    "sleeping", "asleep", "head down",
+    "phone", "mobile", "cellphone", "smartphone", "device",
+    "tamper", "damage", "vandal",
+]
+
+
+def _normalize_ai_response(raw_text: str) -> str:
+    """Normalise AI output so downstream 'ALERT' checks work reliably.
+
+    Handles:
+    - Case variations  ('Alert:', 'alert:', 'ALERT:')
+    - Error passthrough ('Error: ...')
+    - Ambiguous freeform text that describes a prohibited activity but
+      doesn't use the ALERT keyword
+    """
+    if not raw_text:
+        return "Status: Safe"
+
+    # Pass through errors untouched
+    if raw_text.startswith("Error:"):
+        return raw_text
+
+    text_lower = raw_text.lower().strip()
+
+    # Already correctly formatted
+    if text_lower.startswith("alert"):
+        # Capitalise to canonical form: "ALERT: ..."
+        colon_pos = raw_text.find(":")
+        if colon_pos != -1:
+            return "ALERT:" + raw_text[colon_pos + 1:]
+        return "ALERT: " + raw_text[6:].strip()  # len('alert') + possible space
+
+    if "status" in text_lower and "safe" in text_lower:
+        return "Status: Safe"
+
+    # --- Fallback: check for prohibited-activity keywords in freeform text ---
+    for kw in _ACTIVITY_KEYWORDS:
+        if kw in text_lower:
+            # The model described a prohibited activity without using ALERT format
+            description = raw_text.strip().split("\n")[0][:120]
+            log_debug(f"Normalised freeform response to ALERT (matched '{kw}'): {description}")
+            return f"ALERT: {description}"
+
+    # Nothing suspicious found
+    return "Status: Safe"
+
+
 def _frame_hash(pil_img: Image.Image, size: int = 16) -> str:
     """Compute a coarse perceptual hash for deduplication / debugging."""
     gray = pil_img.convert("L").resize((size, size))
@@ -484,14 +554,23 @@ def _run_ai_analysis(
     if state.source_type == "Video File" and state.use_video_mode:
         result_text = ai_engine.analyze_video_clip_as_video(
             clip_images, state.prompt, fps=2.0,
+            system_prompt=SYSTEM_PROMPT,
         )
     else:
-        result_text = ai_engine.analyze_video_clip(clip_images, state.prompt)
+        result_text = ai_engine.analyze_video_clip(
+            clip_images, state.prompt,
+            system_prompt=SYSTEM_PROMPT,
+        )
 
-    log_debug(f"AI detection output: {(result_text or '<empty>')[:200]}")
+    log_debug(f"AI raw output: {(result_text or '<empty>')[:200]}")
+
+    # Normalise so all downstream 'ALERT' checks work regardless of model
+    # casing / freeform responses
+    result_text = _normalize_ai_response(result_text)
+    log_debug(f"AI normalised: {result_text[:200]}")
 
     # --- Pass 2: Bbox localization on the actual last frame ---
-    if "ALERT" in result_text:
+    if "ALERT" in result_text and state.enable_bbox:
         activity_desc = _extract_alert_description(result_text)
         last_raw_frame = snapshot[-1]  # full-resolution original frame
         log_debug(
@@ -586,6 +665,10 @@ def ai_worker_loop() -> None:
         except Exception as exc:
             logger.exception("AI Analysis Error")
             log_debug(f"AI error: {exc}")
+            # Attempt to recover GPU memory after errors (especially OOM)
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 threading.Thread(target=ai_worker_loop, name="AI_Worker", daemon=True).start()
@@ -606,6 +689,7 @@ def _configure_run_params(
     debug_save: bool, sample_strategy: str, use_video_mode: bool,
     buffer_seconds: int = CONFIG.buffer_seconds,
     sample_frames: int = CONFIG.sample_frames,
+    enable_bbox: bool = False,
 ) -> None:
     """Set SystemState parameters for a new monitoring run."""
     strict = source_type == "Video File"
@@ -617,6 +701,7 @@ def _configure_run_params(
     state.use_video_mode = bool(use_video_mode)
     state.buffer_seconds = int(buffer_seconds)
     state.sample_frames = int(sample_frames)
+    state.enable_bbox = bool(enable_bbox)
     log_debug(
         f"Prompt strict mode: {strict}, buffer={state.buffer_seconds}s, "
         f"sample_frames={state.sample_frames}"
@@ -808,13 +893,14 @@ def _process_video_file(
 def monitor_stream(
     source_type, cam_id, video_file, interval_setting,
     prompt_text, debug_enabled, debug_save, sample_strategy, use_video_mode,
-    buffer_seconds, sample_frames,
+    buffer_seconds, sample_frames, enable_bbox,
 ):
     """Main Gradio generator: streams annotated frames with AI analysis."""
     _configure_run_params(
         source_type, prompt_text, debug_enabled,
         debug_save, sample_strategy, use_video_mode,
         buffer_seconds=buffer_seconds, sample_frames=sample_frames,
+        enable_bbox=enable_bbox,
     )
 
     if not ai_engine.ready:
@@ -974,14 +1060,15 @@ def _analyze_uploaded_video(upload_path: str, prompt: str):
     finally:
         cap.release()
 
-    return ai_engine.analyze_video_clip(frames, prompt), None
+    result = ai_engine.analyze_video_clip(frames, prompt, system_prompt=SYSTEM_PROMPT)
+    return _normalize_ai_response(result), None
 
 
 def _analyze_uploaded_image(upload_path: str, prompt: str):
     """Analyse a single uploaded image."""
     img = Image.open(upload_path)
     result = ai_engine.analyze_single_image(img, prompt)
-    return result, img
+    return _normalize_ai_response(result), img
 
 
 def update_prompt_state(new_prompt: str) -> None:
@@ -1052,13 +1139,17 @@ with gr.Blocks(title="Sentinel AI - Video Context") as demo:
                             info="Seconds of video per AI analysis segment",
                         )
                         sample_frames_slider = gr.Slider(
-                            4, 32, value=16, step=1,
+                            4, 16, value=8, step=1,
                             label="Frames Sampled per Segment",
                             info="Number of frames sent to the AI model per segment",
                         )
 
                     use_video_mode = gr.Checkbox(
                         label="Use video mode (experimental)", value=False,
+                    )
+                    enable_bbox_check = gr.Checkbox(
+                        label="Enable bbox localization (extra VRAM)",
+                        value=False,
                     )
                     debug_toggle = gr.Checkbox(
                         label="Debug AI sampling", value=False)
@@ -1083,7 +1174,7 @@ with gr.Blocks(title="Sentinel AI - Video Context") as demo:
                 inputs=[
                     source_type, cam_id, vid_file, interval, prompt_box,
                     debug_toggle, debug_save, sample_strategy, use_video_mode,
-                    buffer_seconds, sample_frames_slider,
+                    buffer_seconds, sample_frames_slider, enable_bbox_check,
                 ],
                 outputs=[live_display, status_box, log_box, debug_box],
             )
